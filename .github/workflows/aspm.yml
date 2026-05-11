@@ -1,0 +1,225 @@
+name: SDAP Code Scan
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sdap-scan:
+    name: SDAP Source Code Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      SERVER_URL: "https://10.20.156.77:9090"
+      API_KEY: "NzIxMjI0Njg0MDU4OTU2"
+      PROJECT_NAME: Lltest0511
+      TASK_NAME: github-action任务
+      ASSET_NAME: github-action资产
+      STRATEGY_ID: 10053
+      PACKAGE_PASSWORD: ${{ secrets.SDAP_PACKAGE_PASSWORD }}
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq zip unzip curl
+
+      - name: Package source code
+        run: |
+          echo "Start packaging source code, PWD:${PWD}"
+
+          echo "=== 当前目录文件列表 ==="
+          ls -la
+          echo "========================="
+
+          zip_file="/tmp/project-source.zip"
+          echo "正在压缩当前目录到: ${zip_file}"
+
+          file_count=$(find . -type f -not -path '*/\.*' | wc -l)
+          echo "发现 ${file_count} 个文件需要压缩"
+
+          if zip -r "${zip_file}" . \
+            -x ".git/*" \
+            -x ".github/*" \
+            -x "node_modules/*" \
+            -x "target/*" \
+            -x "dist/*" \
+            -x "build/*"; then
+              echo "压缩成功完成"
+              file_size=$(du -h "${zip_file}" | cut -f1)
+              file_count_zip=$(unzip -l "${zip_file}" | wc -l)
+              echo "压缩文件大小: ${file_size}"
+              echo "压缩包内文件数量: $((file_count_zip - 4))"
+          else
+              echo "压缩失败!"
+              exit 1
+          fi
+
+          if [ "$(stat -c%s "${zip_file}")" -eq 0 ]; then
+            echo "错误: 压缩文件为空!"
+            exit 1
+          fi
+
+          chmod 755 "${zip_file}"
+
+          echo "=== 压缩文件信息 ==="
+          ls -la "${zip_file}"
+          echo "===================="
+
+      - name: Upload source package
+        id: upload
+        run: |
+          zip_file="/tmp/project-source.zip"
+
+          echo "正在上传文件..."
+          upload_response=$(curl -L "${SERVER_URL}/api/system/file/upload" \
+            -H "x-api-key:${API_KEY}" \
+            -F "file=@${zip_file}" \
+            --insecure)
+
+          echo "上传响应: ${upload_response}"
+
+          if echo "${upload_response}" | jq -e '.data.key' >/dev/null 2>&1; then
+            file_key=$(echo "${upload_response}" | jq -r '.data.key')
+            echo "file_key:${file_key}"
+            echo "file_key=${file_key}" >> "$GITHUB_OUTPUT"
+          else
+            echo "文件上传失败!"
+            echo "详细响应: ${upload_response}"
+            exit 1
+          fi
+
+      - name: Create scan task
+        id: create_task
+        run: |
+          file_key="${{ steps.upload.outputs.file_key }}"
+
+          echo "正在创建扫描任务..."
+
+          request_body=$(jq -n \
+            --arg name "${ASSET_NAME}" \
+            --arg projectName "${PROJECT_NAME}" \
+            --arg taskName "${TASK_NAME}" \
+            --arg fileKey "${file_key}" \
+            --arg password "${PACKAGE_PASSWORD}" \
+            --argjson strategyId "${STRATEGY_ID}" \
+            '{
+              name: $name,
+              projectName: $projectName,
+              strategyId: [$strategyId],
+              taskName: $taskName,
+              fileKey: $fileKey,
+              asset: {
+                type: "SOURCE_CODE"
+              },
+              parameters: {
+                password: $password,
+                deep: 1,
+                vulStyle: "FOR_VUL",
+                languages: [
+                  "JAVA_KOTLIN",
+                  "GOLANG",
+                  "JAVASCRIPT",
+                  "CPP",
+                  "PYTHON",
+                  "PHP",
+                  "NET",
+                  "RUBY",
+                  "RUST",
+                  "SWIFT_OC",
+                  "SCALA",
+                  "PERL",
+                  "ERLANG",
+                  "CLOJURE",
+                  "R"
+                ],
+                detectType: "SOURCE_FILE",
+                url: "http://10.50.133.20/",
+                username: "admin"
+              }
+            }')
+
+          task_resp=$(curl -X POST "${SERVER_URL}/api/asset/dispatch" \
+            -H "Content-Type:application/json" \
+            -H "x-api-key:${API_KEY}" \
+            -d "${request_body}" \
+            --insecure)
+
+          echo "任务创建响应: ${task_resp}"
+
+          task_id=$(echo "${task_resp}" | jq -r '.data.task[0].id')
+
+          if [ -z "${task_id}" ] || [ "${task_id}" = "null" ]; then
+            echo "创建扫描任务失败，未获取到 task_id"
+            exit 1
+          fi
+
+          echo "task_id:${task_id}"
+          echo "task_id=${task_id}" >> "$GITHUB_OUTPUT"
+
+      - name: Poll scan task status
+        run: |
+          task_id="${{ steps.create_task.outputs.task_id }}"
+
+          echo "开始轮询任务状态，task_id:${task_id}"
+
+          while true; do
+            state_response=$(curl -L "${SERVER_URL}/api/task/state/${task_id}" \
+              -H "x-api-key:${API_KEY}" \
+              --insecure)
+
+            echo "${state_response}"
+
+            task_state=$(echo "${state_response}" | jq -r '.data[0].state')
+            echo "task_state:${task_state}"
+
+            if [ "${task_state}" = "SUCCESS" ]; then
+              echo "任务成功完成"
+              echo "================================================"
+
+              scan_id=$(echo "${state_response}" | jq -r '.data[0].scanId')
+              echo "scan_id:${scan_id}"
+
+              report_resp=$(curl -L "${SERVER_URL}/api/project/overview/vul?scanId=${scan_id}&repeat=true" \
+                -H "x-api-key:${API_KEY}" \
+                --insecure)
+
+              echo "${report_resp}"
+
+              critical_count=$(echo "${report_resp}" | jq -r '.data.criticalCount')
+              high_count=$(echo "${report_resp}" | jq -r '.data.highCount')
+              medium_count=$(echo "${report_resp}" | jq -r '.data.mediumCount')
+              low_count=$(echo "${report_resp}" | jq -r '.data.lowCount')
+              info_count=$(echo "${report_resp}" | jq -r '.data.infoCount')
+
+              echo "风险报告:"
+              echo "风险等级     数量"
+              echo "----------------------"
+              echo "超危       ${critical_count}"
+              echo "高危       ${high_count}"
+              echo "中危       ${medium_count}"
+              echo "低危       ${low_count}"
+              echo "信息       ${info_count}"
+              echo "----------------------"
+              echo "================================================"
+
+              break
+
+            elif [ "${task_state}" = "ERROR" ] || [ "${task_state}" = "STOP" ]; then
+              echo "任务异常终止: ${task_state}"
+              exit 1
+            fi
+
+            echo "任务执行中..."
+            sleep 6
+          done
