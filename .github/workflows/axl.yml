@@ -1,0 +1,265 @@
+name: Anxiaolong Code Audit
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  anxiaolong-scan:
+    name: Anxiaolong AI Code Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    env:
+      AXL_SERVER_URL: ${{ secrets.AXL_SERVER_URL }}
+      AXL_API_KEY: ${{ secrets.AXL_API_KEY }}
+      AXL_SKILL_ID: ${{ secrets.AXL_SKILL_ID }}
+      RUNNER_TYPE: simple
+      ENABLE_THINKING: "false"
+      TASK_SOURCE: github-actions
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq zip unzip curl
+
+      - name: Package source code
+        run: |
+          echo "Start packaging source code, PWD:${PWD}"
+
+          zip_file="/tmp/project-source.zip"
+
+          echo "正在压缩当前目录到: ${zip_file}"
+
+          file_count=$(find . -type f -not -path '*/\.*' | wc -l)
+          echo "发现 ${file_count} 个文件需要压缩"
+
+          if zip -r "${zip_file}" . \
+            -x ".git/*" \
+            -x ".github/*" \
+            -x "node_modules/*" \
+            -x "target/*" \
+            -x "dist/*" \
+            -x "build/*"; then
+              echo "压缩成功完成"
+              file_size=$(du -h "${zip_file}" | cut -f1)
+              echo "压缩文件大小: ${file_size}"
+          else
+              echo "压缩失败!"
+              exit 1
+          fi
+
+          if [ "$(stat -c%s "${zip_file}")" -eq 0 ]; then
+            echo "错误: 压缩文件为空!"
+            exit 1
+          fi
+
+          chmod 755 "${zip_file}"
+
+          echo "=== 压缩文件信息 ==="
+          ls -la "${zip_file}"
+          echo "===================="
+
+      - name: Upload source package to Anxiaolong
+        id: upload
+        run: |
+          zip_file="/tmp/project-source.zip"
+
+          echo "正在上传源码压缩包到安小龙..."
+
+          upload_response=$(curl -sS -L "${AXL_SERVER_URL}/dstaff/openapi/v1/task/file/upload" \
+            -H "X-API-Key: ${AXL_API_KEY}" \
+            -F "file=@${zip_file}" \
+            --insecure)
+
+          echo "上传响应: ${upload_response}"
+
+          upload_code=$(echo "${upload_response}" | jq -r '.code // empty')
+
+          if [ "${upload_code}" != "200" ]; then
+            echo "文件上传失败，code=${upload_code}"
+            echo "详细响应: ${upload_response}"
+            exit 1
+          fi
+
+          file_id=$(echo "${upload_response}" | jq -r '.data.fileId // empty')
+          file_name=$(echo "${upload_response}" | jq -r '.data.fileName // empty')
+
+          if [ -z "${file_id}" ] || [ "${file_id}" = "null" ]; then
+            echo "文件上传失败，未获取到 fileId"
+            exit 1
+          fi
+
+          if [ -z "${file_name}" ] || [ "${file_name}" = "null" ]; then
+            file_name="project-source.zip"
+          fi
+
+          echo "file_id=${file_id}"
+          echo "file_name=${file_name}"
+
+          echo "file_id=${file_id}" >> "$GITHUB_OUTPUT"
+          echo "file_name=${file_name}" >> "$GITHUB_OUTPUT"
+
+      - name: Create Anxiaolong scan task
+        id: create_task
+        run: |
+          file_id="${{ steps.upload.outputs.file_id }}"
+          file_name="${{ steps.upload.outputs.file_name }}"
+
+          echo "正在创建安小龙代码审计任务..."
+
+          user_input="请对上传的源代码压缩包进行AI代码安全审计，识别源代码漏洞、组件风险、敏感信息等问题，并生成可交付的审计结果。仓库：${GITHUB_REPOSITORY}，分支：${GITHUB_REF_NAME}，提交：${GITHUB_SHA}。"
+
+          request_body=$(jq -n \
+            --arg skillId "${AXL_SKILL_ID}" \
+            --arg userInput "${user_input}" \
+            --arg fileId "${file_id}" \
+            --arg fileName "${file_name}" \
+            --arg source "${TASK_SOURCE}" \
+            --arg runnerType "${RUNNER_TYPE}" \
+            --arg enableThinking "${ENABLE_THINKING}" \
+            '{
+              skillId: ($skillId | tonumber),
+              userInput: $userInput,
+              files: [
+                {
+                  fileId: $fileId,
+                  fileName: $fileName
+                }
+              ],
+              source: $source,
+              runnerType: $runnerType,
+              enableThinking: ($enableThinking == "true")
+            }')
+
+          echo "创建任务请求体:"
+          echo "${request_body}"
+
+          task_response=$(curl -sS -X POST "${AXL_SERVER_URL}/dstaff/openapi/v1/task/create" \
+            -H "Content-Type: application/json" \
+            -H "X-API-Key: ${AXL_API_KEY}" \
+            -d "${request_body}" \
+            --insecure)
+
+          echo "任务创建响应: ${task_response}"
+
+          task_code=$(echo "${task_response}" | jq -r '.code // empty')
+
+          if [ "${task_code}" != "200" ]; then
+            echo "创建任务失败，code=${task_code}"
+            echo "详细响应: ${task_response}"
+            exit 1
+          fi
+
+          task_id=$(echo "${task_response}" | jq -r '.data // empty')
+
+          if [ -z "${task_id}" ] || [ "${task_id}" = "null" ]; then
+            echo "创建任务失败，未获取到 taskId"
+            exit 1
+          fi
+
+          echo "task_id=${task_id}"
+          echo "task_id=${task_id}" >> "$GITHUB_OUTPUT"
+
+      - name: Poll Anxiaolong task status
+        id: poll_task
+        run: |
+          task_id="${{ steps.create_task.outputs.task_id }}"
+
+          echo "开始轮询安小龙任务状态，task_id=${task_id}"
+
+          while true; do
+            task_data_response=$(curl -sS -L "${AXL_SERVER_URL}/dstaff/openapi/v1/task/data?taskId=${task_id}" \
+              -H "X-API-Key: ${AXL_API_KEY}" \
+              --insecure)
+
+            echo "任务数据响应:"
+            echo "${task_data_response}"
+
+            task_code=$(echo "${task_data_response}" | jq -r '.code // empty')
+
+            if [ "${task_code}" != "200" ]; then
+              echo "查询任务状态失败，code=${task_code}"
+              echo "详细响应: ${task_data_response}"
+              exit 1
+            fi
+
+            task_status=$(echo "${task_data_response}" | jq -r '.data.taskStatus // empty')
+            echo "当前任务状态: ${task_status}"
+
+            if [ "${task_status}" = "FINISHED" ]; then
+              echo "安小龙任务执行完成"
+              echo "${task_data_response}" > /tmp/anxiaolong-task-data.json
+
+              echo "结果文件列表:"
+              echo "${task_data_response}" | jq -r '.data.resultFiles[]? | "- " + .fileName + " / fileId=" + .fileId'
+
+              break
+
+            elif [ "${task_status}" = "FAILED" ] || [ "${task_status}" = "TIMEOUT" ] || [ "${task_status}" = "CANCEL" ] || [ "${task_status}" = "DELETED" ]; then
+              echo "安小龙任务异常结束: ${task_status}"
+              exit 1
+            fi
+
+            echo "任务仍在执行中..."
+            sleep 15
+          done
+
+      - name: Download Anxiaolong result files
+        run: |
+          task_id="${{ steps.create_task.outputs.task_id }}"
+
+          mkdir -p /tmp/anxiaolong-results
+
+          task_data_response=$(curl -sS -L "${AXL_SERVER_URL}/dstaff/openapi/v1/task/data?taskId=${task_id}" \
+            -H "X-API-Key: ${AXL_API_KEY}" \
+            --insecure)
+
+          task_code=$(echo "${task_data_response}" | jq -r '.code // empty')
+
+          if [ "${task_code}" != "200" ]; then
+            echo "获取任务结果失败，code=${task_code}"
+            echo "详细响应: ${task_data_response}"
+            exit 1
+          fi
+
+          result_count=$(echo "${task_data_response}" | jq '.data.resultFiles | length')
+
+          if [ "${result_count}" = "0" ]; then
+            echo "未发现可下载的结果文件"
+            exit 0
+          fi
+
+          echo "${task_data_response}" | jq -r '.data.resultFiles[]? | @base64' | while read -r row; do
+            file_id=$(echo "${row}" | base64 -d | jq -r '.fileId')
+            file_name=$(echo "${row}" | base64 -d | jq -r '.fileName')
+
+            safe_file_name=$(basename "${file_name}")
+
+            echo "正在下载结果文件: ${safe_file_name}, fileId=${file_id}"
+
+            curl -sS -L "${AXL_SERVER_URL}/dstaff/openapi/v1/task/file/download?fileId=${file_id}" \
+              -H "X-API-Key: ${AXL_API_KEY}" \
+              -o "/tmp/anxiaolong-results/${safe_file_name}" \
+              --insecure
+          done
+
+          echo "结果文件下载完成:"
+          ls -la /tmp/anxiaolong-results
+
+      - name: Upload Anxiaolong result artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: anxiaolong-scan-results
+          path: /tmp/anxiaolong-results
+          if-no-files-found: ignore
