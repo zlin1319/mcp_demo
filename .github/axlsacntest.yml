@@ -1,0 +1,367 @@
+name: Anxiaolong AI Code Audit
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  anxiaolong-scan:
+    name: Call Anxiaolong AI Code Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    env:
+      AXL_SERVER_URL: ${{ secrets.AXL_SERVER_URL }}
+      AXL_API_KEY: ${{ secrets.AXL_API_KEY }}
+      AXL_SKILL_ID: ${{ secrets.AXL_SKILL_ID }}
+      RUNNER_TYPE: simple
+      ENABLE_THINKING: "false"
+      SOURCE_NAME: github-actions-test
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Call Anxiaolong API
+        run: |
+          python3 - <<'PY'
+          import os
+          import ssl
+          import json
+          import time
+          import uuid
+          import zipfile
+          import urllib.request
+          import urllib.parse
+          import mimetypes
+          from pathlib import Path
+
+          # =========================
+          # 1. 读取 GitHub Secrets
+          # =========================
+          SERVER_URL = os.environ.get("AXL_SERVER_URL", "").rstrip("/")
+          API_KEY = os.environ.get("AXL_API_KEY", "")
+          SKILL_ID = int(os.environ.get("AXL_SKILL_ID", "0"))
+
+          RUNNER_TYPE = os.environ.get("RUNNER_TYPE", "simple")
+          ENABLE_THINKING = os.environ.get("ENABLE_THINKING", "false").lower() == "true"
+          SOURCE_NAME = os.environ.get("SOURCE_NAME", "github-actions-test")
+
+          if not SERVER_URL:
+              raise RuntimeError("缺少 AXL_SERVER_URL，请在 GitHub Secrets 中配置")
+
+          if not API_KEY:
+              raise RuntimeError("缺少 AXL_API_KEY，请在 GitHub Secrets 中配置")
+
+          if not SKILL_ID:
+              raise RuntimeError("缺少 AXL_SKILL_ID，请在 GitHub Secrets 中配置真实技能ID")
+
+          print("Start Anxiaolong AI code audit task")
+          print("PWD:", os.getcwd())
+          print("SERVER_URL:", SERVER_URL)
+          print("SKILL_ID:", SKILL_ID)
+
+          ssl_context = ssl._create_unverified_context()
+
+          # =========================
+          # 2. 打包当前源码
+          # =========================
+          zip_file = Path("project-source.zip")
+
+          if zip_file.exists():
+              zip_file.unlink()
+
+          exclude_prefixes = [
+              ".git/",
+              ".github/",
+              "node_modules/",
+              "target/",
+              "dist/",
+              "build/",
+              "anxiaolong-results/"
+          ]
+
+          print("正在压缩当前目录到:", zip_file)
+
+          file_count = 0
+
+          with zipfile.ZipFile(zip_file, "w", zipfile.ZIP_DEFLATED) as zf:
+              for root, dirs, files in os.walk("."):
+                  root_path = Path(root)
+
+                  for file_name in files:
+                      file_path = root_path / file_name
+                      relative_path = file_path.as_posix()
+
+                      if relative_path.startswith("./"):
+                          relative_path = relative_path[2:]
+
+                      skip = False
+                      for prefix in exclude_prefixes:
+                          if relative_path.startswith(prefix):
+                              skip = True
+                              break
+
+                      if skip:
+                          continue
+
+                      zf.write(file_path, relative_path)
+                      file_count += 1
+
+          if not zip_file.exists() or zip_file.stat().st_size == 0:
+              raise RuntimeError("源码压缩包为空，停止执行")
+
+          print("压缩完成")
+          print("压缩文件:", zip_file)
+          print("压缩文件大小:", zip_file.stat().st_size)
+          print("压缩文件数量:", file_count)
+
+          # =========================
+          # 3. HTTP 工具函数
+          # =========================
+          def request_json(method, url, headers=None, body=None):
+              headers = headers or {}
+
+              if body is not None and isinstance(body, dict):
+                  body = json.dumps(body, ensure_ascii=False).encode("utf-8")
+                  headers["Content-Type"] = "application/json"
+
+              req = urllib.request.Request(
+                  url=url,
+                  data=body,
+                  headers=headers,
+                  method=method
+              )
+
+              with urllib.request.urlopen(req, context=ssl_context, timeout=120) as resp:
+                  text = resp.read().decode("utf-8")
+                  print("HTTP状态码:", resp.status)
+                  print("响应内容:", text)
+                  return json.loads(text)
+
+          def upload_file(url, file_path):
+              boundary = "----WebKitFormBoundary" + uuid.uuid4().hex
+              file_name = file_path.name
+              content_type = mimetypes.guess_type(file_name)[0] or "application/octet-stream"
+
+              with open(file_path, "rb") as f:
+                  file_data = f.read()
+
+              body = b""
+              body += ("--" + boundary + "\r\n").encode("utf-8")
+              body += (
+                  'Content-Disposition: form-data; name="file"; filename="' + file_name + '"\r\n'
+              ).encode("utf-8")
+              body += ("Content-Type: " + content_type + "\r\n\r\n").encode("utf-8")
+              body += file_data
+              body += b"\r\n"
+              body += ("--" + boundary + "--\r\n").encode("utf-8")
+
+              headers = {
+                  "X-API-Key": API_KEY,
+                  "Content-Type": "multipart/form-data; boundary=" + boundary
+              }
+
+              req = urllib.request.Request(
+                  url=url,
+                  data=body,
+                  headers=headers,
+                  method="POST"
+              )
+
+              with urllib.request.urlopen(req, context=ssl_context, timeout=300) as resp:
+                  text = resp.read().decode("utf-8")
+                  print("HTTP状态码:", resp.status)
+                  print("上传响应:", text)
+                  return json.loads(text)
+
+          # =========================
+          # 4. 上传源码包
+          # =========================
+          upload_url = SERVER_URL + "/dstaff/openapi/v1/task/file/upload"
+
+          print("正在上传源码包到安小龙...")
+          upload_response = upload_file(upload_url, zip_file)
+
+          if str(upload_response.get("code")) != "200":
+              raise RuntimeError("文件上传失败: " + json.dumps(upload_response, ensure_ascii=False))
+
+          upload_data = upload_response.get("data") or {}
+          file_id = upload_data.get("fileId")
+          file_name = upload_data.get("fileName") or "project-source.zip"
+
+          if not file_id:
+              raise RuntimeError("文件上传失败，未获取到 fileId")
+
+          print("fileId:", file_id)
+          print("fileName:", file_name)
+
+          # =========================
+          # 5. 创建安小龙任务
+          # =========================
+          github_repo = os.environ.get("GITHUB_REPOSITORY", "unknown")
+          github_ref = os.environ.get("GITHUB_REF_NAME", "unknown")
+          github_sha = os.environ.get("GITHUB_SHA", "unknown")
+
+          user_input = (
+              "请对上传的源代码压缩包进行AI代码安全审计，"
+              "识别源代码漏洞、开源组件风险、敏感信息泄露等问题，并生成审计结果。"
+              "来源：GitHub Actions，"
+              "仓库：" + github_repo + "，"
+              "分支：" + github_ref + "，"
+              "提交：" + github_sha + "。"
+          )
+
+          create_body = {
+              "skillId": SKILL_ID,
+              "userInput": user_input,
+              "files": [
+                  {
+                      "fileId": file_id,
+                      "fileName": file_name
+                  }
+              ],
+              "source": SOURCE_NAME,
+              "runnerType": RUNNER_TYPE,
+              "enableThinking": ENABLE_THINKING
+          }
+
+          print("创建任务请求体:")
+          print(json.dumps(create_body, ensure_ascii=False, indent=2))
+
+          create_url = SERVER_URL + "/dstaff/openapi/v1/task/create"
+
+          create_response = request_json(
+              "POST",
+              create_url,
+              headers={
+                  "X-API-Key": API_KEY
+              },
+              body=create_body
+          )
+
+          if str(create_response.get("code")) != "200":
+              raise RuntimeError("创建安小龙任务失败: " + json.dumps(create_response, ensure_ascii=False))
+
+          task_id = create_response.get("data")
+
+          if not task_id:
+              raise RuntimeError("创建任务失败，未获取到 taskId")
+
+          print("taskId:", task_id)
+
+          # =========================
+          # 6. 轮询任务状态
+          # =========================
+          print("开始轮询安小龙任务状态...")
+
+          max_poll_count = 240
+          poll_interval = 15
+          final_task_data = None
+
+          for i in range(1, max_poll_count + 1):
+              query = urllib.parse.urlencode({
+                  "taskId": task_id
+              })
+
+              data_url = SERVER_URL + "/dstaff/openapi/v1/task/data?" + query
+
+              task_data_response = request_json(
+                  "GET",
+                  data_url,
+                  headers={
+                      "X-API-Key": API_KEY
+                  }
+              )
+
+              if str(task_data_response.get("code")) != "200":
+                  raise RuntimeError("查询任务状态失败: " + json.dumps(task_data_response, ensure_ascii=False))
+
+              data = task_data_response.get("data") or {}
+              task_status = data.get("taskStatus")
+
+              print("第", i, "次查询任务状态:", task_status)
+
+              if task_status == "FINISHED":
+                  print("安小龙任务执行完成")
+                  final_task_data = data
+                  break
+
+              if task_status in ["FAILED", "TIMEOUT", "CANCEL", "DELETED"]:
+                  raise RuntimeError("安小龙任务异常结束: " + str(task_status))
+
+              if i == max_poll_count:
+                  raise RuntimeError("任务超过最大轮询次数仍未完成")
+
+              print("任务执行中，等待", poll_interval, "秒后继续查询...")
+              time.sleep(poll_interval)
+
+          # =========================
+          # 7. 下载结果文件
+          # =========================
+          result_dir = Path("anxiaolong-results")
+          result_dir.mkdir(parents=True, exist_ok=True)
+
+          result_files = []
+
+          if final_task_data:
+              result_files = final_task_data.get("resultFiles") or []
+
+          if not result_files:
+              print("未发现可下载的结果文件")
+          else:
+              print("结果文件列表:")
+              for item in result_files:
+                  print("-", item.get("fileName"), "/", item.get("fileId"))
+
+              for item in result_files:
+                  result_file_id = item.get("fileId")
+                  result_file_name = item.get("fileName") or (result_file_id + ".bin")
+
+                  if not result_file_id:
+                      continue
+
+                  safe_file_name = Path(result_file_name).name
+                  download_url = SERVER_URL + "/dstaff/openapi/v1/task/file/download?" + urllib.parse.urlencode({
+                      "fileId": result_file_id
+                  })
+
+                  print("正在下载结果文件:", safe_file_name)
+
+                  req = urllib.request.Request(
+                      url=download_url,
+                      headers={
+                          "X-API-Key": API_KEY
+                      },
+                      method="GET"
+                  )
+
+                  with urllib.request.urlopen(req, context=ssl_context, timeout=300) as resp:
+                      content = resp.read()
+
+                  output_file = result_dir / safe_file_name
+
+                  with open(output_file, "wb") as f:
+                      f.write(content)
+
+                  print("已下载:", output_file, "大小:", output_file.stat().st_size)
+
+          print("安小龙结果目录:")
+          for item in result_dir.iterdir():
+              print("-", item)
+
+          print("安小龙接口链路测试完成")
+          PY
+
+      - name: Upload Anxiaolong result artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: anxiaolong-scan-results
+          path: anxiaolong-results/**
+          if-no-files-found: ignore
