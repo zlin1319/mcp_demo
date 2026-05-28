@@ -1,18 +1,20 @@
-name: Anxiaolong Code Audit
+name: Anxiaolong AI Code Audit
 
 on:
   push:
-    branches: [ "main" ]
-  pull_request:
     branches: [ "main" ]
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: anxiaolong-scan-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   anxiaolong-scan:
-    name: Anxiaolong AI Code Audit
+    name: Call Anxiaolong AI Code Audit
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
@@ -22,244 +24,518 @@ jobs:
       AXL_SKILL_ID: ${{ secrets.AXL_SKILL_ID }}
       RUNNER_TYPE: simple
       ENABLE_THINKING: "false"
-      TASK_SOURCE: github-actions
+      SOURCE_NAME: github-actions
+      MAX_PACKAGE_MB: "500"
+      MAX_SINGLE_FILE_MB: "50"
 
     steps:
       - name: Checkout source code
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+          fetch-depth: 1
 
-      - name: Install dependencies
+      - name: Call Anxiaolong API
         run: |
-          sudo apt-get update
-          sudo apt-get install -y jq zip unzip curl
+          python3 - <<'PY'
+          import os
+          import ssl
+          import json
+          import time
+          import uuid
+          import zipfile
+          import urllib.request
+          import urllib.parse
+          import mimetypes
+          import fnmatch
+          from pathlib import Path
 
-      - name: Package source code
-        run: |
-          echo "Start packaging source code, PWD:${PWD}"
+          # =========================
+          # 1. 读取 GitHub Secrets
+          # =========================
+          SERVER_URL = os.environ.get("AXL_SERVER_URL", "").rstrip("/")
+          API_KEY = os.environ.get("AXL_API_KEY", "")
+          SKILL_ID_RAW = os.environ.get("AXL_SKILL_ID", "0")
 
-          zip_file="/tmp/project-source.zip"
+          RUNNER_TYPE = os.environ.get("RUNNER_TYPE", "simple")
+          ENABLE_THINKING = os.environ.get("ENABLE_THINKING", "false").lower() == "true"
+          SOURCE_NAME = os.environ.get("SOURCE_NAME", "github-actions")
 
-          echo "正在压缩当前目录到: ${zip_file}"
+          MAX_PACKAGE_MB = int(os.environ.get("MAX_PACKAGE_MB", "500"))
+          MAX_SINGLE_FILE_MB = int(os.environ.get("MAX_SINGLE_FILE_MB", "50"))
 
-          file_count=$(find . -type f -not -path '*/\.*' | wc -l)
-          echo "发现 ${file_count} 个文件需要压缩"
+          if not SERVER_URL:
+              raise RuntimeError("缺少 AXL_SERVER_URL，请在 GitHub Secrets 中配置")
 
-          if zip -r "${zip_file}" . \
-            -x ".git/*" \
-            -x ".github/*" \
-            -x "node_modules/*" \
-            -x "target/*" \
-            -x "dist/*" \
-            -x "build/*"; then
-              echo "压缩成功完成"
-              file_size=$(du -h "${zip_file}" | cut -f1)
-              echo "压缩文件大小: ${file_size}"
-          else
-              echo "压缩失败!"
-              exit 1
-          fi
+          if not SERVER_URL.startswith("https://"):
+              raise RuntimeError("AXL_SERVER_URL 必须使用 https://，生产环境不允许使用 http://")
 
-          if [ "$(stat -c%s "${zip_file}")" -eq 0 ]; then
-            echo "错误: 压缩文件为空!"
-            exit 1
-          fi
+          if not API_KEY:
+              raise RuntimeError("缺少 AXL_API_KEY，请在 GitHub Secrets 中配置")
 
-          chmod 755 "${zip_file}"
+          try:
+              SKILL_ID = int(SKILL_ID_RAW)
+          except ValueError:
+              raise RuntimeError("AXL_SKILL_ID 必须是数字类型，请检查 GitHub Secrets 配置")
 
-          echo "=== 压缩文件信息 ==="
-          ls -la "${zip_file}"
-          echo "===================="
+          if not SKILL_ID:
+              raise RuntimeError("缺少 AXL_SKILL_ID，请在 GitHub Secrets 中配置真实技能ID")
 
-      - name: Upload source package to Anxiaolong
-        id: upload
-        run: |
-          zip_file="/tmp/project-source.zip"
+          print("Start Anxiaolong AI code audit task")
+          print("PWD:", os.getcwd())
+          print("SERVER_URL:", SERVER_URL)
+          print("SKILL_ID:", SKILL_ID)
+          print("SOURCE_NAME:", SOURCE_NAME)
 
-          echo "正在上传源码压缩包到安小龙..."
+          # 生产环境强制启用系统默认证书校验，不关闭 TLS 校验
+          ssl_context = ssl.create_default_context()
 
-          upload_response=$(curl -sS -L "${AXL_SERVER_URL}/dstaff/openapi/v1/task/file/upload" \
-            -H "X-API-Key: ${AXL_API_KEY}" \
-            -F "file=@${zip_file}" \
-            --insecure)
+          # =========================
+          # 2. 打包当前源码
+          # =========================
+          zip_file = Path("/tmp/project-source.zip")
 
-          echo "上传响应: ${upload_response}"
+          if zip_file.exists():
+              zip_file.unlink()
 
-          upload_code=$(echo "${upload_response}" | jq -r '.code // empty')
+          result_dir = Path("anxiaolong-results")
+          if result_dir.exists():
+              for item in result_dir.iterdir():
+                  if item.is_file():
+                      item.unlink()
+          else:
+              result_dir.mkdir(parents=True, exist_ok=True)
 
-          if [ "${upload_code}" != "200" ]; then
-            echo "文件上传失败，code=${upload_code}"
-            echo "详细响应: ${upload_response}"
-            exit 1
-          fi
+          exclude_prefixes = [
+              ".git/",
+              ".github/",
+              "node_modules/",
+              "target/",
+              "dist/",
+              "build/",
+              "coverage/",
+              ".idea/",
+              ".vscode/",
+              ".gradle/",
+              ".mvn/",
+              ".venv/",
+              "venv/",
+              "__pycache__/",
+              "anxiaolong-results/"
+          ]
 
-          file_id=$(echo "${upload_response}" | jq -r '.data.fileId // empty')
-          file_name=$(echo "${upload_response}" | jq -r '.data.fileName // empty')
+          exclude_names = [
+              ".env",
+              ".env.local",
+              ".env.production",
+              ".env.test",
+              ".npmrc",
+              ".pypirc",
+              ".netrc",
+              "id_rsa",
+              "id_rsa.pub",
+              "known_hosts",
+              "project-source.zip"
+          ]
 
-          if [ -z "${file_id}" ] || [ "${file_id}" = "null" ]; then
-            echo "文件上传失败，未获取到 fileId"
-            exit 1
-          fi
+          exclude_patterns = [
+              ".env.*",
+              "*/.env",
+              "*/.env.*",
 
-          if [ -z "${file_name}" ] || [ "${file_name}" = "null" ]; then
-            file_name="project-source.zip"
-          fi
+              "*.pem",
+              "*.key",
+              "*.crt",
+              "*.cer",
+              "*.p12",
+              "*.pfx",
+              "*.jks",
+              "*.keystore",
 
-          echo "file_id=${file_id}"
-          echo "file_name=${file_name}"
+              "*.sqlite",
+              "*.sqlite3",
+              "*.db",
+              "*.log",
+              "*.bak",
+              "*.tmp",
 
-          echo "file_id=${file_id}" >> "$GITHUB_OUTPUT"
-          echo "file_name=${file_name}" >> "$GITHUB_OUTPUT"
+              "*.zip",
+              "*.tar",
+              "*.tar.gz",
+              "*.tgz",
+              "*.rar",
+              "*.7z",
+              "*.gz",
 
-      - name: Create Anxiaolong scan task
-        id: create_task
-        run: |
-          file_id="${{ steps.upload.outputs.file_id }}"
-          file_name="${{ steps.upload.outputs.file_name }}"
+              "*.png",
+              "*.jpg",
+              "*.jpeg",
+              "*.gif",
+              "*.bmp",
+              "*.webp",
+              "*.mp4",
+              "*.mov",
+              "*.avi",
+              "*.pdf",
+              "*.doc",
+              "*.docx",
+              "*.xls",
+              "*.xlsx",
 
-          echo "正在创建安小龙代码审计任务..."
+              "application-prod.yml",
+              "application-prod.yaml",
+              "application-production.yml",
+              "application-production.yaml",
+              "bootstrap-prod.yml",
+              "bootstrap-prod.yaml"
+          ]
 
-          user_input="请对上传的源代码压缩包进行AI代码安全审计，识别源代码漏洞、组件风险、敏感信息等问题，并生成可交付的审计结果。仓库：${GITHUB_REPOSITORY}，分支：${GITHUB_REF_NAME}，提交：${GITHUB_SHA}。"
+          max_single_file_bytes = MAX_SINGLE_FILE_MB * 1024 * 1024
+          max_package_bytes = MAX_PACKAGE_MB * 1024 * 1024
 
-          request_body=$(jq -n \
-            --arg skillId "${AXL_SKILL_ID}" \
-            --arg userInput "${user_input}" \
-            --arg fileId "${file_id}" \
-            --arg fileName "${file_name}" \
-            --arg source "${TASK_SOURCE}" \
-            --arg runnerType "${RUNNER_TYPE}" \
-            --arg enableThinking "${ENABLE_THINKING}" \
-            '{
-              skillId: ($skillId | tonumber),
-              userInput: $userInput,
-              files: [
-                {
-                  fileId: $fileId,
-                  fileName: $fileName
-                }
+          def should_exclude(relative_path, file_path):
+              normalized = relative_path.replace("\\", "/")
+              name = Path(normalized).name
+
+              if file_path.is_symlink():
+                  return True, "skip symlink"
+
+              if not file_path.is_file():
+                  return True, "skip non-regular file"
+
+              for prefix in exclude_prefixes:
+                  if normalized.startswith(prefix):
+                      return True, "matched exclude prefix: " + prefix
+
+              if name in exclude_names:
+                  return True, "matched exclude name: " + name
+
+              for pattern in exclude_patterns:
+                  if fnmatch.fnmatch(normalized, pattern) or fnmatch.fnmatch(name, pattern):
+                      return True, "matched exclude pattern: " + pattern
+
+              try:
+                  if file_path.stat().st_size > max_single_file_bytes:
+                      return True, "file too large"
+              except OSError:
+                  return True, "cannot stat file"
+
+              return False, ""
+
+          print("正在压缩当前目录到:", zip_file)
+
+          file_count = 0
+          skipped_count = 0
+
+          with zipfile.ZipFile(zip_file, "w", zipfile.ZIP_DEFLATED) as zf:
+              for root, dirs, files in os.walk("."):
+                  root_path = Path(root)
+
+                  for file_name in files:
+                      file_path = root_path / file_name
+                      relative_path = file_path.as_posix()
+
+                      if relative_path.startswith("./"):
+                          relative_path = relative_path[2:]
+
+                      exclude, reason = should_exclude(relative_path, file_path)
+
+                      if exclude:
+                          skipped_count += 1
+                          continue
+
+                      zf.write(file_path, relative_path)
+                      file_count += 1
+
+          if not zip_file.exists() or zip_file.stat().st_size == 0:
+              raise RuntimeError("源码压缩包为空，停止执行")
+
+          package_size = zip_file.stat().st_size
+
+          if package_size > max_package_bytes:
+              raise RuntimeError(
+                  "源码压缩包超过限制，当前大小: "
+                  + str(package_size)
+                  + " bytes，限制: "
+                  + str(max_package_bytes)
+                  + " bytes"
+              )
+
+          print("压缩完成")
+          print("压缩文件:", zip_file)
+          print("压缩文件大小:", package_size)
+          print("压缩文件数量:", file_count)
+          print("排除文件数量:", skipped_count)
+
+          # =========================
+          # 3. HTTP 工具函数
+          # =========================
+          def request_json(method, url, headers=None, body=None, timeout=120):
+              headers = headers or {}
+
+              if body is not None and isinstance(body, dict):
+                  body = json.dumps(body, ensure_ascii=False).encode("utf-8")
+                  headers["Content-Type"] = "application/json"
+
+              req = urllib.request.Request(
+                  url=url,
+                  data=body,
+                  headers=headers,
+                  method=method
+              )
+
+              try:
+                  with urllib.request.urlopen(req, context=ssl_context, timeout=timeout) as resp:
+                      text = resp.read().decode("utf-8")
+                      print("HTTP状态码:", resp.status)
+                      print("响应内容:", text)
+                      return json.loads(text)
+              except urllib.error.HTTPError as e:
+                  error_body = e.read().decode("utf-8", errors="replace")
+                  raise RuntimeError(
+                      "HTTP请求失败，状态码: "
+                      + str(e.code)
+                      + "，响应: "
+                      + error_body
+                  )
+
+          def upload_file(url, file_path):
+              boundary = "----WebKitFormBoundary" + uuid.uuid4().hex
+              file_name = file_path.name
+              content_type = mimetypes.guess_type(file_name)[0] or "application/octet-stream"
+
+              with open(file_path, "rb") as f:
+                  file_data = f.read()
+
+              body = b""
+              body += ("--" + boundary + "\r\n").encode("utf-8")
+              body += (
+                  'Content-Disposition: form-data; name="file"; filename="' + file_name + '"\r\n'
+              ).encode("utf-8")
+              body += ("Content-Type: " + content_type + "\r\n\r\n").encode("utf-8")
+              body += file_data
+              body += b"\r\n"
+              body += ("--" + boundary + "--\r\n").encode("utf-8")
+
+              headers = {
+                  "X-API-Key": API_KEY,
+                  "Content-Type": "multipart/form-data; boundary=" + boundary
+              }
+
+              req = urllib.request.Request(
+                  url=url,
+                  data=body,
+                  headers=headers,
+                  method="POST"
+              )
+
+              try:
+                  with urllib.request.urlopen(req, context=ssl_context, timeout=300) as resp:
+                      text = resp.read().decode("utf-8")
+                      print("HTTP状态码:", resp.status)
+                      print("上传响应:", text)
+                      return json.loads(text)
+              except urllib.error.HTTPError as e:
+                  error_body = e.read().decode("utf-8", errors="replace")
+                  raise RuntimeError(
+                      "文件上传请求失败，状态码: "
+                      + str(e.code)
+                      + "，响应: "
+                      + error_body
+                  )
+
+          # =========================
+          # 4. 上传源码包
+          # =========================
+          upload_url = SERVER_URL + "/dstaff/openapi/v1/task/file/upload"
+
+          print("正在上传源码包到安小龙...")
+          upload_response = upload_file(upload_url, zip_file)
+
+          if str(upload_response.get("code")) != "200":
+              raise RuntimeError("文件上传失败: " + json.dumps(upload_response, ensure_ascii=False))
+
+          upload_data = upload_response.get("data") or {}
+          file_id = upload_data.get("fileId")
+          file_name = upload_data.get("fileName") or "project-source.zip"
+
+          if not file_id:
+              raise RuntimeError("文件上传失败，未获取到 fileId")
+
+          print("fileId:", file_id)
+          print("fileName:", file_name)
+
+          # =========================
+          # 5. 创建安小龙任务
+          # =========================
+          github_repo = os.environ.get("GITHUB_REPOSITORY", "unknown")
+          github_ref = os.environ.get("GITHUB_REF_NAME", "unknown")
+          github_sha = os.environ.get("GITHUB_SHA", "unknown")
+          github_run_id = os.environ.get("GITHUB_RUN_ID", "unknown")
+          github_actor = os.environ.get("GITHUB_ACTOR", "unknown")
+
+          user_input = (
+              "请对上传的源代码压缩包进行AI代码安全审计，"
+              "识别源代码漏洞、开源组件风险、敏感信息泄露等问题，并生成审计结果。"
+              "来源：GitHub Actions，"
+              "仓库：" + github_repo + "，"
+              "分支：" + github_ref + "，"
+              "提交：" + github_sha + "，"
+              "执行ID：" + github_run_id + "，"
+              "触发人：" + github_actor + "。"
+          )
+
+          create_body = {
+              "skillId": SKILL_ID,
+              "userInput": user_input,
+              "files": [
+                  {
+                      "fileId": file_id,
+                      "fileName": file_name
+                  }
               ],
-              source: $source,
-              runnerType: $runnerType,
-              enableThinking: ($enableThinking == "true")
-            }')
+              "source": SOURCE_NAME,
+              "runnerType": RUNNER_TYPE,
+              "enableThinking": ENABLE_THINKING
+          }
 
-          echo "创建任务请求体:"
-          echo "${request_body}"
+          print("创建任务请求体:")
+          print(json.dumps(create_body, ensure_ascii=False, indent=2))
 
-          task_response=$(curl -sS -X POST "${AXL_SERVER_URL}/dstaff/openapi/v1/task/create" \
-            -H "Content-Type: application/json" \
-            -H "X-API-Key: ${AXL_API_KEY}" \
-            -d "${request_body}" \
-            --insecure)
+          create_url = SERVER_URL + "/dstaff/openapi/v1/task/create"
 
-          echo "任务创建响应: ${task_response}"
+          create_response = request_json(
+              "POST",
+              create_url,
+              headers={
+                  "X-API-Key": API_KEY
+              },
+              body=create_body
+          )
 
-          task_code=$(echo "${task_response}" | jq -r '.code // empty')
+          if str(create_response.get("code")) != "200":
+              raise RuntimeError("创建安小龙任务失败: " + json.dumps(create_response, ensure_ascii=False))
 
-          if [ "${task_code}" != "200" ]; then
-            echo "创建任务失败，code=${task_code}"
-            echo "详细响应: ${task_response}"
-            exit 1
-          fi
+          task_id = create_response.get("data")
 
-          task_id=$(echo "${task_response}" | jq -r '.data // empty')
+          if not task_id:
+              raise RuntimeError("创建任务失败，未获取到 taskId")
 
-          if [ -z "${task_id}" ] || [ "${task_id}" = "null" ]; then
-            echo "创建任务失败，未获取到 taskId"
-            exit 1
-          fi
+          print("taskId:", task_id)
 
-          echo "task_id=${task_id}"
-          echo "task_id=${task_id}" >> "$GITHUB_OUTPUT"
+          # =========================
+          # 6. 轮询任务状态
+          # =========================
+          print("开始轮询安小龙任务状态...")
 
-      - name: Poll Anxiaolong task status
-        id: poll_task
-        run: |
-          task_id="${{ steps.create_task.outputs.task_id }}"
+          max_poll_count = 240
+          poll_interval = 15
+          final_task_data = None
 
-          echo "开始轮询安小龙任务状态，task_id=${task_id}"
+          for i in range(1, max_poll_count + 1):
+              query = urllib.parse.urlencode({
+                  "taskId": task_id
+              })
 
-          while true; do
-            task_data_response=$(curl -sS -L "${AXL_SERVER_URL}/dstaff/openapi/v1/task/data?taskId=${task_id}" \
-              -H "X-API-Key: ${AXL_API_KEY}" \
-              --insecure)
+              data_url = SERVER_URL + "/dstaff/openapi/v1/task/data?" + query
 
-            echo "任务数据响应:"
-            echo "${task_data_response}"
+              task_data_response = request_json(
+                  "GET",
+                  data_url,
+                  headers={
+                      "X-API-Key": API_KEY
+                  }
+              )
 
-            task_code=$(echo "${task_data_response}" | jq -r '.code // empty')
+              if str(task_data_response.get("code")) != "200":
+                  raise RuntimeError("查询任务状态失败: " + json.dumps(task_data_response, ensure_ascii=False))
 
-            if [ "${task_code}" != "200" ]; then
-              echo "查询任务状态失败，code=${task_code}"
-              echo "详细响应: ${task_data_response}"
-              exit 1
-            fi
+              data = task_data_response.get("data") or {}
+              task_status = data.get("taskStatus")
 
-            task_status=$(echo "${task_data_response}" | jq -r '.data.taskStatus // empty')
-            echo "当前任务状态: ${task_status}"
+              print("第", i, "次查询任务状态:", task_status)
 
-            if [ "${task_status}" = "FINISHED" ]; then
-              echo "安小龙任务执行完成"
-              echo "${task_data_response}" > /tmp/anxiaolong-task-data.json
+              if task_status == "FINISHED":
+                  print("安小龙任务执行完成")
+                  final_task_data = data
+                  break
 
-              echo "结果文件列表:"
-              echo "${task_data_response}" | jq -r '.data.resultFiles[]? | "- " + .fileName + " / fileId=" + .fileId'
+              if task_status in ["FAILED", "TIMEOUT", "CANCEL", "DELETED"]:
+                  raise RuntimeError("安小龙任务异常结束: " + str(task_status))
 
-              break
+              if i == max_poll_count:
+                  raise RuntimeError("任务超过最大轮询次数仍未完成")
 
-            elif [ "${task_status}" = "FAILED" ] || [ "${task_status}" = "TIMEOUT" ] || [ "${task_status}" = "CANCEL" ] || [ "${task_status}" = "DELETED" ]; then
-              echo "安小龙任务异常结束: ${task_status}"
-              exit 1
-            fi
+              print("任务执行中，等待", poll_interval, "秒后继续查询...")
+              time.sleep(poll_interval)
 
-            echo "任务仍在执行中..."
-            sleep 15
-          done
+          # =========================
+          # 7. 下载结果文件
+          # =========================
+          result_files = []
 
-      - name: Download Anxiaolong result files
-        run: |
-          task_id="${{ steps.create_task.outputs.task_id }}"
+          if final_task_data:
+              result_files = final_task_data.get("resultFiles") or []
 
-          mkdir -p /tmp/anxiaolong-results
+          if not result_files:
+              raise RuntimeError("安小龙任务已完成，但未发现可下载的结果文件")
 
-          task_data_response=$(curl -sS -L "${AXL_SERVER_URL}/dstaff/openapi/v1/task/data?taskId=${task_id}" \
-            -H "X-API-Key: ${AXL_API_KEY}" \
-            --insecure)
+          print("结果文件列表:")
+          for item in result_files:
+              print("-", item.get("fileName"), "/", item.get("fileId"))
 
-          task_code=$(echo "${task_data_response}" | jq -r '.code // empty')
+          for item in result_files:
+              result_file_id = item.get("fileId")
+              result_file_name = item.get("fileName") or (result_file_id + ".bin")
 
-          if [ "${task_code}" != "200" ]; then
-            echo "获取任务结果失败，code=${task_code}"
-            echo "详细响应: ${task_data_response}"
-            exit 1
-          fi
+              if not result_file_id:
+                  continue
 
-          result_count=$(echo "${task_data_response}" | jq '.data.resultFiles | length')
+              safe_file_name = Path(result_file_name).name
+              download_url = SERVER_URL + "/dstaff/openapi/v1/task/file/download?" + urllib.parse.urlencode({
+                  "fileId": result_file_id
+              })
 
-          if [ "${result_count}" = "0" ]; then
-            echo "未发现可下载的结果文件"
-            exit 0
-          fi
+              print("正在下载结果文件:", safe_file_name)
 
-          echo "${task_data_response}" | jq -r '.data.resultFiles[]? | @base64' | while read -r row; do
-            file_id=$(echo "${row}" | base64 -d | jq -r '.fileId')
-            file_name=$(echo "${row}" | base64 -d | jq -r '.fileName')
+              req = urllib.request.Request(
+                  url=download_url,
+                  headers={
+                      "X-API-Key": API_KEY
+                  },
+                  method="GET"
+              )
 
-            safe_file_name=$(basename "${file_name}")
+              try:
+                  with urllib.request.urlopen(req, context=ssl_context, timeout=300) as resp:
+                      content = resp.read()
+              except urllib.error.HTTPError as e:
+                  error_body = e.read().decode("utf-8", errors="replace")
+                  raise RuntimeError(
+                      "结果文件下载失败，状态码: "
+                      + str(e.code)
+                      + "，响应: "
+                      + error_body
+                  )
 
-            echo "正在下载结果文件: ${safe_file_name}, fileId=${file_id}"
+              output_file = result_dir / safe_file_name
 
-            curl -sS -L "${AXL_SERVER_URL}/dstaff/openapi/v1/task/file/download?fileId=${file_id}" \
-              -H "X-API-Key: ${AXL_API_KEY}" \
-              -o "/tmp/anxiaolong-results/${safe_file_name}" \
-              --insecure
-          done
+              with open(output_file, "wb") as f:
+                  f.write(content)
 
-          echo "结果文件下载完成:"
-          ls -la /tmp/anxiaolong-results
+              print("已下载:", output_file, "大小:", output_file.stat().st_size)
+
+          print("安小龙结果目录:")
+          for item in result_dir.iterdir():
+              print("-", item)
+
+          print("安小龙扫描任务完成")
+          PY
 
       - name: Upload Anxiaolong result artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: anxiaolong-scan-results
-          path: /tmp/anxiaolong-results
-          if-no-files-found: ignore
+          path: anxiaolong-results/**
+          if-no-files-found: error
+          retention-days: 7
